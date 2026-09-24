@@ -252,3 +252,127 @@ System Load. All queries reused from Phase 2's verified query set.
 - Provisioning-as-code prevents UI/git drift (editable: false enforces this)
 - "No data" (datasource unreachable) != "DOWN" (target unreachable but datasource fine) - different failure domains, different detection needs
 - Grafana auto-retries a failed datasource with no manual intervention required
+
+## Cross-Host Networking — Faran-Linux Onboarded
+
+### Problem
+Noman-Linux (WSL2 NAT, 172.27.x) and Faran-Linux (WSL2 NAT, 172.18.x) each sit
+behind their own private Hyper-V virtual switch, invisible to the other
+physical host. No route exists between the two WSL subnets directly.
+
+### Solution
+`netsh interface portproxy` on Faran-Win forwards its real LAN IP:port into
+Faran-Linux's private WSL IP:port:
+```powershell
+netsh interface portproxy add v4tov4 listenaddress=172.16.9.20 listenport=9100 connectaddress=172.18.236.106 connectport=9100
+```
+Full path proven end-to-end: Noman-Linux (WSL NAT egress) -> LAN ->
+Faran-Win:9100 (portproxy) -> Faran-Linux:9100 (Node Exporter).
+
+LAB ONLY caveat: portproxy rules are NOT persistent across Windows reboots,
+and the connectaddress (WSL2 internal IP) can change across WSL restarts
+(DHCP-leased from the internal switch). Production would need this
+re-applied via a startup script bound to the current WSL IP - not
+implemented here.
+
+### Configuration
+Faran-Linux added to the existing `job: "node"` (not a new job - same
+category of thing being monitored), with a `host` label added to
+distinguish true host identity from the network path used to reach it
+(instance shows the portproxy address, not Faran-Linux's real WSL IP):
+```yaml
+  - job_name: "node"
+    static_configs:
+      - targets: ["localhost:9100"]
+        labels:
+          host: "Noman-Linux"
+      - targets: ["172.16.9.20:9100"]
+        labels:
+          host: "Faran-Linux"
+```
+
+### Verification
+- Reachability proven in isolated stages: Noman-Win -> Faran-Win (portproxy)
+  first, then Noman-Linux -> same path, separating "does the portproxy work"
+  from "does Noman-Linux's own WSL NAT egress work"
+- Both `node` targets show `health: "up"` with distinct `host` labels
+- `node_load1` returns two genuinely distinct values from two real hosts
+
+### Troubleshooting
+| Symptom | Cause | Diagnostic | Fix |
+|---|---|---|---|
+| Orphaned time series with missing label after a relabel/config change | Prometheus does not migrate history when a label set changes - it starts a new series and abandons the old one | `query{label=""}` to match the label-absent series explicitly | Expected behavior, not a bug. Old series goes stale after ~5 min (default staleness timeout, NOT the scrape interval) and stops appearing in instant queries |
+| `up=0`, error = "connection refused" | AMBIGUOUS: could mean the target process died, OR a network path/proxy between Prometheus and the target broke | Cannot be determined from Prometheus's error text alone - must check target process, then network path, then any proxy/forwarding layer, in order | This is a real, unavoidable limitation - `up` tells you THAT something failed, never WHY |
+| Cross-host target unreachable despite exporter and firewall both fine | WSL2-to-WSL2 across two hosts has no route by default (double NAT) | Test in isolated hops: Windows-to-Windows first, then WSL-to-Windows, before assuming exporter is broken | netsh portproxy on the target's own Windows host |
+
+### What I should understand
+- Two independent WSL2 NAT boundaries do not compose into a route - each
+  needs its own forwarding solution, tested in isolation before combining
+- Relabeling/adding labels creates new series, orphans old ones - a
+  real, quiet cardinality cost of routine config changes
+- up=0 is a binary signal only - diagnosing WHY requires checking every
+  layer in the path, not trusting the error text to be specific
+- Per-target failure isolation confirmed directly (Faran-Linux down did
+  not affect Noman-Linux's health at all)
+
+## Cross-Host Networking — Faran-Linux Onboarded
+
+### Problem
+Noman-Linux (WSL2 NAT, 172.27.x) and Faran-Linux (WSL2 NAT, 172.18.x) each sit
+behind their own private Hyper-V virtual switch, invisible to the other
+physical host. No route exists between the two WSL subnets directly.
+
+### Solution
+`netsh interface portproxy` on Faran-Win forwards its real LAN IP:port into
+Faran-Linux's private WSL IP:port:
+```powershell
+netsh interface portproxy add v4tov4 listenaddress=172.16.9.20 listenport=9100 connectaddress=172.18.236.106 connectport=9100
+```
+Full path proven end-to-end: Noman-Linux (WSL NAT egress) -> LAN ->
+Faran-Win:9100 (portproxy) -> Faran-Linux:9100 (Node Exporter).
+
+LAB ONLY caveat: portproxy rules are NOT persistent across Windows reboots,
+and the connectaddress (WSL2 internal IP) can change across WSL restarts
+(DHCP-leased from the internal switch). Production would need this
+re-applied via a startup script bound to the current WSL IP - not
+implemented here.
+
+### Configuration
+Faran-Linux added to the existing `job: "node"` (not a new job - same
+category of thing being monitored), with a `host` label added to
+distinguish true host identity from the network path used to reach it
+(instance shows the portproxy address, not Faran-Linux's real WSL IP):
+```yaml
+  - job_name: "node"
+    static_configs:
+      - targets: ["localhost:9100"]
+        labels:
+          host: "Noman-Linux"
+      - targets: ["172.16.9.20:9100"]
+        labels:
+          host: "Faran-Linux"
+```
+
+### Verification
+- Reachability proven in isolated stages: Noman-Win -> Faran-Win (portproxy)
+  first, then Noman-Linux -> same path, separating "does the portproxy work"
+  from "does Noman-Linux's own WSL NAT egress work"
+- Both `node` targets show `health: "up"` with distinct `host` labels
+- `node_load1` returns two genuinely distinct values from two real hosts
+
+### Troubleshooting
+| Symptom | Cause | Diagnostic | Fix |
+|---|---|---|---|
+| Orphaned time series with missing label after a relabel/config change | Prometheus does not migrate history when a label set changes - it starts a new series and abandons the old one | `query{label=""}` to match the label-absent series explicitly | Expected behavior, not a bug. Old series goes stale after ~5 min (default staleness timeout, NOT the scrape interval) and stops appearing in instant queries |
+| `up=0`, error = "connection refused" | AMBIGUOUS: could mean the target process died, OR a network path/proxy between Prometheus and the target broke | Cannot be determined from Prometheus's error text alone - must check target process, then network path, then any proxy/forwarding layer, in order | This is a real, unavoidable limitation - `up` tells you THAT something failed, never WHY |
+| Cross-host target unreachable despite exporter and firewall both fine | WSL2-to-WSL2 across two hosts has no route by default (double NAT) | Test in isolated hops: Windows-to-Windows first, then WSL-to-Windows, before assuming exporter is broken | netsh portproxy on the target's own Windows host |
+
+### What I should understand
+- Two independent WSL2 NAT boundaries do not compose into a route - each
+  needs its own forwarding solution, tested in isolation before combining
+- Relabeling/adding labels creates new series, orphans old ones - a
+  real, quiet cardinality cost of routine config changes
+- up=0 is a binary signal only - diagnosing WHY requires checking every
+  layer in the path, not trusting the error text to be specific
+- Per-target failure isolation confirmed directly (Faran-Linux down did
+  not affect Noman-Linux's health at all)
