@@ -115,7 +115,68 @@ prometheus --config.file=prometheus/prometheus.yml --storage.tsdb.path=prometheu
 
 ## Phase 2 — Node Exporter
 
-_Not started._
+### Purpose
+Translates kernel/OS state (/proc, /sys) into Prometheus exposition format.
+Prometheus has no native knowledge of CPU/memory/disk - Node Exporter is the
+reference implementation of the "exporter" pattern.
+
+### Architecture
+Single stateless binary, no config file, controlled via CLI flags only.
+Architecturally identical to any other scrape target - "just another job"
+in Prometheus's eyes, same as self-monitoring.
+
+### Installation
+- Version: v1.12.1 (verified against Docker Hub / Helm chart release refs)
+- Binary installed to `/usr/local/bin/`
+- No config file - default collectors only, no flags used yet
+
+### Configuration
+Added as a second scrape job (prometheus.yml):
+```yaml
+  - job_name: "node"
+    static_configs:
+      - targets: ["localhost:9100"]
+```
+Job named "node" (category of thing monitored), not "node_exporter" (the
+tool) - enables clean `by (instance)` grouping once multiple hosts exist.
+
+### Commands
+```bash
+node_exporter                 # foreground, default collectors
+curl http://localhost:9100/metrics
+```
+
+### Verification
+- Raw `/metrics` inspected directly before Prometheus ingestion (1054 node_ metric lines)
+- `prometheus_tsdb_head_series`: 1001 -> 2210 after onboarding this one target
+- Both targets (`prometheus`, `node`) show `health: "up"` via /api/v1/targets
+
+### PromQL
+See `prometheus/rules/example-queries.md` for verified queries:
+CPU %, memory %, disk %, network rate, load average, host availability.
+
+### Troubleshooting
+| Symptom | Cause | Diagnostic | Fix |
+|---|---|---|---|
+| `up{job="node"}` = 0 | Node Exporter process not running | `ps aux \| grep node_exporter` | Restart node_exporter |
+| Detection lag on failure | Scrape interval bounds detection speed | Check `lastScrape` timing in /api/v1/targets | Expected - fastest detection = scrape_interval |
+| Some collectors produce zero metrics | WSL2 lacks hardware interfaces (hwmon, rapl, nvme, etc.) | `curl .../metrics \| grep <collector>` | Expected on WSL2 - not a bug |
+| Identical avail_bytes across mountpoints | WSL2 mounts share one underlying virtual disk | Compare `device=` label across mountpoints | Expected - not independent filesystems |
+
+### Production Notes
+- LAB ONLY: manual foreground execution. Production needs systemd service.
+- Exporter port 9100 currently only reachable locally on Noman-Linux -
+  cross-host exposure (Faran-Linux) requires the portproxy work noted in
+  the Architecture section.
+- rate() valid only on counters (node_cpu_seconds_total,
+  node_network_*_bytes_total) - never on gauges (node_memory_*, node_load1).
+
+### What I should understand
+- Exporter pattern: translates OS state to Prometheus format, nothing more
+- Node Exporter is architecturally "just another target" - no special casing
+- Multi-label counters (cpu x mode) compound cardinality
+- Detection latency is bounded by scrape_interval, not instantaneous
+- WSL2-specific metric quirks (shared disk, missing hardware collectors)
 
 ## Phase 3 — Grafana
 
