@@ -180,4 +180,75 @@ CPU %, memory %, disk %, network rate, load average, host availability.
 
 ## Phase 3 — Grafana
 
-_Not started._
+### Purpose
+Visualization and query federation layer. Grafana stores no metrics/logs/traces
+itself - every panel queries Prometheus (or Loki/Tempo later) live, at render
+time. Its only persistent state is its own metadata (dashboards, datasources,
+users) in an internal SQLite DB.
+
+### Architecture
+Full application tree (not a single binary) - binary + web assets + default
+config + bundled plugins. Sits above Prometheus as a query/view layer, never
+holds time-series data itself.
+
+### Installation
+- Version: v13.1.1 (verified via FreeBSD ports update trail - v13.0 is a major
+  release: /api path deprecated in favor of /apis, React 18->19 internally)
+- Application tree installed to `/opt/grafana` (not version-controlled)
+- Custom config + provisioning in `grafana/` (version-controlled)
+
+### Configuration
+`grafana.ini` overrides only `http_port` and `[paths]` (provisioning, data) -
+everything else falls back to Grafana's own defaults.ini.
+
+Datasource provisioned as code (`provisioning/datasources/prometheus.yml`):
+- `access: proxy` - Grafana's backend queries Prometheus, browser never talks
+  to Prometheus directly (security boundary)
+- `editable: false` - prevents UI drift from what's in git
+
+Dashboard provisioned as code (`provisioning/dashboards/provider.yml` +
+`noman-linux-host-overview.json`) - built manually first via UI, then
+exported and committed, per "no blind dashboard imports" rule.
+
+### Commands
+```bash
+/opt/grafana/bin/grafana server \
+  --config=grafana/grafana.ini \
+  --homepath=/opt/grafana
+```
+
+### Verification
+- `curl .../api/health` -> database: "ok"
+- `curl .../api/datasources` -> Prometheus datasource present, access=proxy
+- `curl .../api/search?query=Noman-Linux` -> dashboard present, same uid
+  across manual creation and provisioning-driven restart
+- Startup log: `provisioning.dashboard ... "finished to provision dashboards"`
+  confirms file-based provisioning actually applied, not just present in DB
+
+### PromQL / Dashboard
+6 panels: Host Availability (stat), CPU/Memory/Disk %, Network Receive Rate,
+System Load. All queries reused from Phase 2's verified query set.
+
+### Troubleshooting
+| Symptom | Cause | Diagnostic | Fix |
+|---|---|---|---|
+| Datasource works but panel shows wrong magnitude/unit | Wrong unit selected in panel (e.g. "milli" prefix instead of correct SI scale) | Compare panel value against direct `curl` query to Prometheus | Re-select correct unit under Standard Options |
+| All panels show "No data" with red warning triangles | Prometheus (the datasource) is down - NOT the same as a target being down | Click the warning triangle for the actual connection error | Restart Prometheus; Grafana auto-recovers on next refresh, no manual nudge needed |
+| Graph line looks continuous across a known outage window | Grafana connects across null/missing points by default | Compare against known outage timestamps | Deliberate dashboard design choice - not a bug, revisit null-fill settings if gaps should be visible |
+| SQLite "database is locked" on startup | Concurrent internal writes during migrations/provisioning | Check `/api/health` after startup completes | Benign at this scale; production moves to Postgres/MySQL |
+
+### Production Notes
+- LAB ONLY: manual foreground execution, default admin credentials changed
+  but no SSO/RBAC configured.
+- SQLite is the internal DB - fine for single-instance lab use, not
+  recommended once multiple Grafana instances or real concurrent load exist.
+- "No data" vs "DOWN" distinction matters operationally - a dashboard alone
+  cannot distinguish "target unhealthy" from "monitoring backend unhealthy."
+  This gap is exactly why "monitor the monitoring stack" is a later phase.
+
+### What I should understand
+- Grafana holds no time-series data - it is a live query/view layer only
+- access: proxy vs direct - security boundary, browser never talks to backend directly
+- Provisioning-as-code prevents UI/git drift (editable: false enforces this)
+- "No data" (datasource unreachable) != "DOWN" (target unreachable but datasource fine) - different failure domains, different detection needs
+- Grafana auto-retries a failed datasource with no manual intervention required
