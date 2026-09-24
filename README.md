@@ -41,7 +41,77 @@ observability-lab/
 
 ## Phase 1 — Prometheus
 
-_In progress._
+### Purpose
+Pull-based metrics collection. Prometheus scrapes `/metrics` HTTP endpoints on a
+schedule rather than waiting for targets to push data, so target unavailability
+itself becomes observable (`up == 0`) instead of producing silence.
+
+### Architecture
+Single binary: scrape manager, TSDB (local disk), PromQL query engine, rule
+evaluator, all in one process. No external database.
+
+### Installation
+- Version: v3.12.0 (verified against official prometheus.io/download.json —
+  Prometheus 3.x line; classic console-template UI removed, new web UI is default)
+- Binary installed to `/usr/local/bin/` (not version-controlled)
+- Config lives in `prometheus/prometheus.yml` (version-controlled)
+
+### Configuration
+Minimal config, self-scrape only:
+```yaml
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["localhost:9090"]
+```
+`alerting:` and `rule_files:` intentionally omitted (not commented out) since
+neither is in use yet — added explicitly in Phase 2.
+
+### Commands
+```bash
+promtool check config prometheus/prometheus.yml
+prometheus --config.file=prometheus/prometheus.yml --storage.tsdb.path=prometheus/data
+```
+
+### Verification
+- `curl http://localhost:9090/-/healthy` and `/-/ready`
+- `curl http://localhost:9090/api/v1/targets` — target health = "up"
+- `curl -G .../api/v1/query --data-urlencode 'query=up'` — value = "1"
+
+### PromQL
+- `up` — synthetic liveness gauge per target
+- `prometheus_tsdb_head_series` — gauge, active series count (1001 from
+  self-monitoring alone — histograms fan out into many series per metric name)
+- `rate(prometheus_http_requests_total[1m])` — counter-to-per-second-rate;
+  sliding window, not a running total — can legitimately read 0
+
+### Troubleshooting
+| Symptom | Cause | Diagnostic | Fix |
+|---|---|---|---|
+| Empty response, 0 bytes, no error | Unescaped PromQL special chars (`()[]`) in raw curl URL | `curl -s -o /dev/null -w "%{http_code}"` | Use `curl -G --data-urlencode` |
+| `rate()` returns empty result | Not enough samples yet in window, or truly no recent traffic to that handler | Re-run after generating traffic | Wait, or generate traffic, and re-check |
+| Startup log shows stale lockfile warning | Previous process did not shut down gracefully (crash, kill -9, OOM) | Check for this WARN on every startup | Not fatal — WAL replay handles it; investigate why prior process died |
+
+### Production Notes
+- Bound to `0.0.0.0:9090` by default — reachable from LAN if firewall allowed it.
+  Currently blocked by Noman-Win's firewall (deliberate, not yet revisited).
+- Default retention: 15 days. Not yet tuned for this lab's actual needs.
+- WAL provides durability against hard kills (verified: kill -9 test, 3 WAL
+  segments replayed cleanly, zero data loss, only lockfile cleanup was skipped).
+- LAB ONLY: running in foreground manually. Production needs a supervised
+  service (systemd) with restart policy — not yet implemented.
+
+### What I should understand
+- Pull vs push model and why `up` matters
+- job vs instance label distinction
+- Counter vs gauge behavior
+- rate() is windowed, not cumulative
+- One metric name can be many time series (cardinality)
+- Graceful vs hard shutdown, and what the WAL actually protects
 
 ## Phase 2 — Node Exporter
 
