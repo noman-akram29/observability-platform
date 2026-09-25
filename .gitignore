@@ -1,3 +1,4 @@
 # TSDB data - binary, instance-specific, grows continuously. Never version-controlled.
 prometheus/data/
 grafana/data/
+alertmanager/data/

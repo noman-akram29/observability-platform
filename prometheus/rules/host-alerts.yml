@@ -1,0 +1,11 @@
+groups:
+  - name: host_availability
+    rules:
+      - alert: HostDown
+        expr: up{job="node"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Host {{ $labels.host }} is down"
+          description: "{{ $labels.host }} ({{ $labels.instance }}) has been unreachable for over 1 minute."
