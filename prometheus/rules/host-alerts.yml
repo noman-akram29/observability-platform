@@ -9,3 +9,41 @@ groups:
         annotations:
           summary: "Host {{ $labels.host }} is down"
           description: "{{ $labels.host }} ({{ $labels.instance }}) has been unreachable for over 1 minute."
+
+      - alert: PrometheusTargetDown
+        expr: up{job="prometheus"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Prometheus self-scrape target is down"
+          description: "Prometheus has not successfully scraped itself for over 1 minute. This likely indicates Prometheus is overloaded or crashing."
+
+  - name: host_resources
+    rules:
+      - alert: HighCPU
+        expr: 100 - (avg by (host, instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 85
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High CPU on {{ $labels.host }}"
+          description: "{{ $labels.host }} CPU usage has been above 85% for 5 minutes (currently {{ $value | printf \"%.1f\" }}%)."
+
+      - alert: HighMemory
+        expr: 100 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes * 100) > 90
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High memory usage on {{ $labels.host }}"
+          description: "{{ $labels.host }} memory usage has been above 90% for 5 minutes (currently {{ $value | printf \"%.1f\" }}%)."
+
+      - alert: DiskAlmostFull
+        expr: 100 - (node_filesystem_avail_bytes{mountpoint="/"} / node_filesystem_size_bytes{mountpoint="/"} * 100) > 85
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Disk almost full on {{ $labels.host }}"
+          description: "{{ $labels.host }} root filesystem usage has been above 85% for 10 minutes (currently {{ $value | printf \"%.1f\" }}%)."
