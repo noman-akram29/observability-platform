@@ -1,0 +1,25 @@
+service:
+  flush: 1
+  log_level: info
+
+parsers:
+  - name: prometheus_logfmt
+    format: logfmt
+
+pipeline:
+  inputs:
+    - name: systemd
+      tag: prometheus.log
+      systemd_filter: _SYSTEMD_UNIT=prometheus.service
+      read_from_tail: true
+
+  filters:
+    - name: parser
+      match: prometheus.log
+      key_name: MESSAGE
+      parser: prometheus_logfmt
+      reserve_data: true
+
+  outputs:
+    - name: stdout
+      match: "*"
