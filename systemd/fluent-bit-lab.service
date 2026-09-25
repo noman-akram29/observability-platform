@@ -1,0 +1,13 @@
+[Unit]
+Description=Fluent Bit (observability-lab)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/fluent-bit --config=/home/nomanakram/observability-lab/fluent-bit/fluent-bit.yml
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
