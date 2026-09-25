@@ -1,0 +1,14 @@
+[Unit]
+Description=Prometheus
+After=network.target
+
+[Service]
+Type=simple
+User=nomanakram
+WorkingDirectory=/home/nomanakram/observability-lab
+ExecStart=/usr/local/bin/prometheus --config.file=prometheus/prometheus.yml --storage.tsdb.path=prometheus/data
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

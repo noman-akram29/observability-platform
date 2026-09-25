@@ -1,0 +1,13 @@
+[Unit]
+Description=Local webhook listener for Alertmanager testing
+After=network.target
+
+[Service]
+Type=simple
+User=nomanakram
+ExecStart=/usr/bin/python3 /home/nomanakram/observability-lab/alertmanager/webhook-listener.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

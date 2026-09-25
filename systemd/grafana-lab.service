@@ -1,0 +1,13 @@
+[Unit]
+Description=Grafana (observability-lab)
+After=network.target
+
+[Service]
+Type=simple
+User=nomanakram
+ExecStart=/opt/grafana/bin/grafana server --config=/home/nomanakram/observability-lab/grafana/grafana.ini --homepath=/opt/grafana
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

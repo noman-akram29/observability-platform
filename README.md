@@ -398,3 +398,53 @@ Faran-Linux failures from silently merging into one ambiguous notification.
 - Never trust an apt "package not found" suggestion without checking
   whether it conflicts with an intentionally-versioned binary install
 
+## Production Hardening — systemd Services
+
+### Purpose
+Every component up to this point ran manually in a foreground terminal -
+explicitly marked LAB ONLY throughout every phase. This converts all five
+to systemd services with automatic restart, closing that gap.
+
+### What changed
+All five components (Prometheus, Node Exporter, Grafana, Alertmanager, and
+our own webhook-listener test tool) now run as systemd units with
+`Restart=on-failure` and `RestartSec=5`. Unit files committed to
+`systemd/` in this repo (copies of what is installed at
+`/etc/systemd/system/`).
+
+Key differences from manual execution:
+- `ExecStart` uses full absolute paths (no reliance on PATH or CWD except
+  where `WorkingDirectory` is explicitly set for relative config paths)
+- Output goes to the systemd journal, not a terminal -
+  `journalctl -u <service> -f` replaces watching a foreground terminal
+- Grafana's service is deliberately named `grafana-lab`, not `grafana` -
+  avoids future collision with Grafana's own official package unit name
+  (`grafana-server.service`), which does not exist here since we installed
+  manually via tarball, not apt
+
+### Verification
+- Each service individually hard-killed (`kill -9`) and confirmed to
+  auto-recover with a new PID within the RestartSec window, no manual
+  intervention
+- ALL FIVE simultaneously hard-killed (`pkill -9` across all processes at
+  once) and confirmed full-stack auto-recovery: all targets returned to
+  `up`, dashboard intact, all 5 alert rules reloaded correctly from disk
+  and back to `inactive`
+
+### Troubleshooting
+| Symptom | Cause | Diagnostic | Fix |
+|---|---|---|---|
+| Service shows `activating (auto-restart)` repeatedly, never reaches `active (running)` | A genuine startup failure being masked as a restart loop - NOT actual recovery | `journalctl -u <service> -n 30` to see the real exit error, not just `systemctl status`'s truncated summary | Diagnose the real error (in our case: leftover foreground process still holding port 9094, blocking the new systemd-managed instance from binding it) |
+| Alertmanager fails to bind port 9094 | An old foreground/manual instance was never actually stopped before starting the systemd service - two processes competing for the same port | `sudo ss -tlnp \| grep 9094` to find the real PID holding the port | Kill the orphaned process explicitly, then start the service fresh |
+
+### What I should understand
+- `Restart=on-failure` is the actual production behavior every prior
+  phase's "LAB ONLY: manual execution" caveat was pointing toward
+- `systemctl status` showing `activating (auto-restart)` is a FAILURE
+  signal, not a recovery signal - a service endlessly restarting without
+  reaching `active (running)` needs `journalctl` investigation immediately,
+  not assumption that "it'll figure itself out"
+- Moving to systemd changes where output goes (journal, not terminal) -
+  a real operational shift, not just a cosmetic one
+- Full-stack simultaneous failure recovery is a meaningfully different,
+  stronger guarantee than individually-tested single-component recovery
