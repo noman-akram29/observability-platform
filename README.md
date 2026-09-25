@@ -315,64 +315,86 @@ distinguish true host identity from the network path used to reach it
 - Per-target failure isolation confirmed directly (Faran-Linux down did
   not affect Noman-Linux's health at all)
 
-## Cross-Host Networking — Faran-Linux Onboarded
+## Phase 4 — Alertmanager
 
-### Problem
-Noman-Linux (WSL2 NAT, 172.27.x) and Faran-Linux (WSL2 NAT, 172.18.x) each sit
-behind their own private Hyper-V virtual switch, invisible to the other
-physical host. No route exists between the two WSL subnets directly.
+### Purpose
+Takes Prometheus's alert-rule evaluations (is a condition true?) and handles
+what happens next: routing, grouping, deduplication, inhibition, delivery.
+Deliberately a separate process from Prometheus - detection logic and
+notification/routing logic are different concerns.
 
-### Solution
-`netsh interface portproxy` on Faran-Win forwards its real LAN IP:port into
-Faran-Linux's private WSL IP:port:
-```powershell
-netsh interface portproxy add v4tov4 listenaddress=172.16.9.20 listenport=9100 connectaddress=172.18.236.106 connectport=9100
-```
-Full path proven end-to-end: Noman-Linux (WSL NAT egress) -> LAN ->
-Faran-Win:9100 (portproxy) -> Faran-Linux:9100 (Node Exporter).
+### Architecture
+Standalone binary (not a library inside Prometheus). Always initializes a
+gossip/cluster subsystem (port 9094) even running solo - this is the
+mechanism used for HA deduplication across multiple Alertmanager replicas
+in production; irrelevant but harmless for our single-instance lab.
 
-LAB ONLY caveat: portproxy rules are NOT persistent across Windows reboots,
-and the connectaddress (WSL2 internal IP) can change across WSL restarts
-(DHCP-leased from the internal switch). Production would need this
-re-applied via a startup script bound to the current WSL IP - not
-implemented here.
+### Installation
+- Version: v0.34.0 (verified via Helm chart update reference)
+- CAUTION: `apt install prometheus-alertmanager` installs v0.26.0 (8 minor
+  versions behind) AND auto-starts a systemd service bound to :9093 -
+  had to stop/disable/purge it before using the correct binary. Real
+  lesson: never blindly follow an apt "not found" suggestion in this
+  project - always check whether an official binary is the intended path.
+- Binary + amtool installed to /usr/local/bin/ (not version-controlled)
+- Config in `alertmanager/alertmanager.yml` (version-controlled)
 
 ### Configuration
-Faran-Linux added to the existing `job: "node"` (not a new job - same
-category of thing being monitored), with a `host` label added to
-distinguish true host identity from the network path used to reach it
-(instance shows the portproxy address, not Faran-Linux's real WSL IP):
 ```yaml
-  - job_name: "node"
-    static_configs:
-      - targets: ["localhost:9100"]
-        labels:
-          host: "Noman-Linux"
-      - targets: ["172.16.9.20:9100"]
-        labels:
-          host: "Faran-Linux"
+route:
+  group_by: [\'alertname\', \'host\']
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 1h
+  receiver: \'local-webhook\'
+
+receivers:
+  - name: \'local-webhook\'
+    webhook_configs:
+      - url: \'http://127.0.0.1:5001/\'
 ```
+Receiver is a local Python HTTP listener (`webhook-listener.py`) - chosen
+deliberately over email/Slack for the first pass, to prove the pipeline
+mechanism using only components already in the lab, before adding real
+external notification dependencies.
+
+group_by includes `host` (not just alertname) - prevents Noman-Linux and
+Faran-Linux failures from silently merging into one ambiguous notification.
+
+### Alert Rules (prometheus/rules/host-alerts.yml)
+| Alert | Threshold | for: | severity | Reasoning |
+|---|---|---|---|---|
+| HostDown | up{job="node"}==0 | 1m | critical | Fast - full unavailability is unambiguous and urgent |
+| PrometheusTargetDown | up{job="prometheus"}==0 | 1m | critical | LIMITATION: can only catch Prometheus degrading while still partially alive - a full crash means nothing is left to evaluate this rule or notify. True crash detection needs an EXTERNAL watchdog (later "monitor the monitoring stack" phase) |
+| HighCPU | >85% | 5m | warning | Headroom before real saturation; 5m filters transient spikes (e.g. our own curl/jq bursts earlier) |
+| HighMemory | >90% | 5m | warning | Higher than CPU - much of "used" memory is reclaimable cache, not genuinely committed |
+| DiskAlmostFull | >85% | 10m | warning | Disk fill is always a slow trend, never a legitimate transient - longest window, no benefit to a short one |
 
 ### Verification
-- Reachability proven in isolated stages: Noman-Win -> Faran-Win (portproxy)
-  first, then Noman-Linux -> same path, separating "does the portproxy work"
-  from "does Noman-Linux's own WSL NAT egress work"
-- Both `node` targets show `health: "up"` with distinct `host` labels
-- `node_load1` returns two genuinely distinct values from two real hosts
+- Full alert lifecycle proven for HostDown: inactive -> pending (activeAt
+  matches up flip) -> firing (exactly for: duration later) -> resolved
+  (real endsAt timestamp) -> inactive, via real webhook payloads
+- Measured real latency: firing to notification ~30s (group_wait);
+  condition-cleared to resolution-notification ~1m45s (evaluation_interval
+  + Alertmanager resolve_timeout stacking)
 
 ### Troubleshooting
 | Symptom | Cause | Diagnostic | Fix |
 |---|---|---|---|
-| Orphaned time series with missing label after a relabel/config change | Prometheus does not migrate history when a label set changes - it starts a new series and abandons the old one | `query{label=""}` to match the label-absent series explicitly | Expected behavior, not a bug. Old series goes stale after ~5 min (default staleness timeout, NOT the scrape interval) and stops appearing in instant queries |
-| `up=0`, error = "connection refused" | AMBIGUOUS: could mean the target process died, OR a network path/proxy between Prometheus and the target broke | Cannot be determined from Prometheus's error text alone - must check target process, then network path, then any proxy/forwarding layer, in order | This is a real, unavoidable limitation - `up` tells you THAT something failed, never WHY |
-| Cross-host target unreachable despite exporter and firewall both fine | WSL2-to-WSL2 across two hosts has no route by default (double NAT) | Test in isolated hops: Windows-to-Windows first, then WSL-to-Windows, before assuming exporter is broken | netsh portproxy on the target's own Windows host |
+| Rule reaches "pending" then resets to "inactive" without firing | rate() over a [5m] window needs the FULL window filled with consistently-over-threshold samples - a rolling window still containing pre-load idle samples reports a lower value than true current load, so a short/interrupted stress test can dip back under threshold before for: completes | Run one continuous load for significantly longer than for: alone suggests (window fill time + for: duration, not just for: duration) | Sustained, uninterrupted load; watch the raw query value ramp up over time, not just the alert state |
+| bash uses a stale binary path after replacing an apt-installed tool | bash caches (hashes) resolved command locations per shell session | `which <tool>` shows an old path that no longer exists | `hash -r` to force PATH re-resolution |
 
 ### What I should understand
-- Two independent WSL2 NAT boundaries do not compose into a route - each
-  needs its own forwarding solution, tested in isolation before combining
-- Relabeling/adding labels creates new series, orphans old ones - a
-  real, quiet cardinality cost of routine config changes
-- up=0 is a binary signal only - diagnosing WHY requires checking every
-  layer in the path, not trusting the error text to be specific
-- Per-target failure isolation confirmed directly (Faran-Linux down did
-  not affect Noman-Linux's health at all)
+- Alert lifecycle: inactive -> pending -> firing -> resolved, each
+  transition driven by a real, measurable timing mechanism (for:,
+  group_wait, resolve_timeout) - not instantaneous
+- rate() window fill time and for: duration COMPOUND - a synthetic test
+  needs to account for both, not just the stated for: value
+- Labels drive routing; annotations are display-only, and templating a
+  label that does not exist on that alert\'s series silently renders empty
+  rather than erroring
+- Self-monitoring has a hard limit: a rule cannot detect the total failure
+  of the system evaluating it - only external monitoring can
+- Never trust an apt "package not found" suggestion without checking
+  whether it conflicts with an intentionally-versioned binary install
+
