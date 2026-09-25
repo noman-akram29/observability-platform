@@ -448,3 +448,109 @@ Key differences from manual execution:
   a real operational shift, not just a cosmetic one
 - Full-stack simultaneous failure recovery is a meaningfully different,
   stronger guarantee than individually-tested single-component recovery
+
+## Phase 5 — Fluent Bit
+
+### Purpose
+Log collection agent - reads logs from wherever they are produced, parses
+them into structured fields, forwards to a destination. Distinct from log
+storage/query (Loki, next phase) - Fluent Bit only ships and structures,
+it does not store or let you search historically.
+
+### Architecture
+Pipeline stages: Input -> Parser -> Filter -> Output. Single lightweight
+process per host, reads continuously, buffers, forwards.
+
+### A real constraint this phase exposed
+By the time this phase started, all five prior services had already been
+converted to systemd (see Production Hardening section) - meaning NONE of
+them write to a flat log file anymore. All service logs go to journald.
+This made the `systemd` input the only correct choice, not `tail` - a
+direct, honest consequence of the production-hardening done earlier, not
+the original plan.
+
+### Installation
+- Version: v5.1.2 (Fluent Bit\'s OWN official apt repository -
+  packages.fluentbit.io - genuinely different from the earlier Alertmanager
+  apt mistake, which pulled from Ubuntu\'s generic universe repo. This is
+  the officially recommended install path for this specific tool.)
+- Binary actually lives at /opt/fluent-bit/bin/fluent-bit (package
+  installs there, not /usr/bin) - symlinked to /usr/local/bin for
+  consistency with every other tool in this lab
+
+### Configuration
+```yaml
+service:
+  flush: 1
+  log_level: info
+
+parsers:
+  - name: prometheus_logfmt
+    format: logfmt
+
+pipeline:
+  inputs:
+    - name: systemd
+      tag: prometheus.log
+      systemd_filter: _SYSTEMD_UNIT=prometheus.service
+      read_from_tail: true
+
+  filters:
+    - name: parser
+      match: prometheus.log
+      key_name: MESSAGE
+      parser: prometheus_logfmt
+      reserve_data: true
+
+  outputs:
+    - name: stdout
+      match: "*"
+```
+- `systemd` input (not `tail`) - required since Prometheus logs to
+  journald only
+- `read_from_tail: true` - start from current journal position, not full
+  history
+- Parser filter re-parses journald\'s opaque `MESSAGE` field using
+  Prometheus\'s own logfmt format, extracting `time`, `level`, `source`,
+  `msg` as independent fields
+- `reserve_data: true` - keeps ALL original journald metadata
+  (_SYSTEMD_UNIT, _PID, _HOSTNAME, etc.) alongside newly parsed fields,
+  nothing discarded
+
+### Verification
+- Before parser: MESSAGE field was one opaque string containing
+  Prometheus\'s full logfmt line - level=ERROR would have been unqueryable
+  text buried inside a blob
+- After parser: level, source, msg, and every custom key
+  (duration, filename, component, etc.) are independent structured fields
+- Tested across multiple real Prometheus restarts, including
+  multi-key lines (TSDB timing breakdowns) and quoted-value lines
+  (msg="Loading configuration file" filename=...) - all parsed correctly,
+  zero fallback to unparsed MESSAGE observed
+
+### Troubleshooting
+| Symptom | Cause | Diagnostic | Fix |
+|---|---|---|---|
+| journald metadata present but no time/level/source fields | Parser filter not matching, or key_name pointing at wrong field | Check filter `match` pattern against input `tag` | Confirm tag/match alignment; verify `key_name: MESSAGE` matches journald\'s actual field name |
+| Fluent Bit systemd service fails to read journal entries | systemd input requires elevated privileges to read journald | Check service User= setting | Run as root (accepted here) or add user to systemd-journal group (better for production, not implemented) |
+| Binary not found after apt install from official repo | Package installs to /opt/<tool>/bin, not /usr/bin - not on PATH by default | `dpkg -L <package> \| grep bin` | Symlink into /usr/local/bin for consistency |
+
+### Production Notes
+- LAB ONLY: runs as root for journald access. Production should use the
+  systemd-journal group instead of full root.
+- Service named `fluent-bit-lab`, not `fluent-bit` - avoids collision with
+  the official package\'s own unit (which exists, disabled, from the apt
+  install itself)
+- Currently outputs to stdout/journal only - not yet forwarding anywhere
+  persistent. Next phase (Loki) gives this a real destination.
+
+### What I should understand
+- Fluent Bit ships and structures logs - it does not store or provide
+  historical query, that is Loki\'s job
+- systemd/journald-based logging is now the norm for services, not the
+  exception - a real log pipeline needs the systemd input, not just tail
+- A parser filter is a distinct pipeline stage from the input - input
+  gets raw records, filters transform/enrich them, independently
+  configurable and testable
+- Reading privileged log sources (journald) has a real access-control
+  cost - root or specific group membership, not automatic
